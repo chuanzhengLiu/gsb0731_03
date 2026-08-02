@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 from django.db import models as django_models
 
-from .models import Schedule, ScheduleConflict, ScheduleStatus, ConflictType
+from .models import Schedule, ScheduleConflict, ScheduleStatus, ConflictType, MIN_TURNAROUND_MINUTES
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +17,8 @@ def _get_schedule_time_range(schedule: Schedule) -> Tuple[Optional[datetime], Op
 
 
 def _times_overlap(s1: datetime, e1: datetime, s2: datetime, e2: datetime) -> bool:
-    return s1 <= e2 and s2 <= e1
+    # 使用半开区间 [start, end)，首尾相接（前一场结束时间等于后一场开始时间）不算冲突
+    return s1 < e2 and s2 < e1
 
 
 def detect_conflicts_for_schedule(schedule: Schedule) -> List[ScheduleConflict]:
@@ -165,6 +166,83 @@ def resolve_conflicts_for_schedule(schedule: Schedule) -> int:
     count = qs.filter(resolved=False).count()
     qs.update(resolved=True)
     return count
+
+
+def _times_too_close(
+    s1: datetime, e1: datetime, s2: datetime, e2: datetime,
+    buffer_minutes: int = MIN_TURNAROUND_MINUTES,
+) -> bool:
+    # 首尾相接（间隔为 0）时同样算太近。真正重叠的属于冲突、不是提醒，由 turnaround_gap_if_too_close 返回 None 排除。
+    return turnaround_gap_if_too_close(s1, e1, s2, e2, buffer_minutes) is not None
+
+
+def gap_minutes_between(
+    s1: datetime, e1: datetime, s2: datetime, e2: datetime,
+) -> Optional[float]:
+    # 两段时间的间隔分钟数；复用 _times_overlap 判定：重叠返回 None（重叠是冲突，语义上不是"间隔"）。
+    if _times_overlap(s1, e1, s2, e2):
+        return None
+    if e1 <= s2:
+        return (s2 - e1).total_seconds() / 60
+    return (s1 - e2).total_seconds() / 60
+
+
+def turnaround_gap_if_too_close(
+    s1: datetime, e1: datetime, s2: datetime, e2: datetime,
+    buffer_minutes: int = MIN_TURNAROUND_MINUTES,
+) -> Optional[float]:
+    # 共用入口：间隔不足 buffer_minutes（含首尾相接的 0）时返回间隔分钟数，否则返回 None。
+    # 正好等于 buffer_minutes 视为足够，返回 None。重叠同样返回 None（那是冲突不是"太近"）。
+    gap = gap_minutes_between(s1, e1, s2, e2)
+    if gap is None or gap >= buffer_minutes:
+        return None
+    return gap
+
+
+def detect_proximity_warnings_for_schedule(schedule: Schedule) -> List[dict]:
+    start1, end1 = _get_schedule_time_range(schedule)
+    if not start1 or not end1 or not schedule.dm_id or not schedule.room_id:
+        return []
+
+    warnings = []
+
+    other_schedules = Schedule.objects.filter(
+        ~django_models.Q(id=schedule.id),
+        ~django_models.Q(status=ScheduleStatus.CANCELLED),
+    ).select_related('dm', 'room')
+
+    for other in other_schedules:
+        start2, end2 = _get_schedule_time_range(other)
+        if not start2 or not end2:
+            continue
+
+        if not _times_too_close(start1, end1, start2, end2):
+            continue
+
+        same_dm = (
+            schedule.dm_id and other.dm_id and
+            schedule.dm_id == other.dm_id
+        )
+        same_room = (
+            schedule.room_id and other.room_id and
+            schedule.room_id == other.room_id
+        )
+
+        if same_dm:
+            warnings.append({
+                'type': ConflictType.DM_CONFLICT,
+                'other_schedule_id': other.id,
+                'message': f'DM#{schedule.dm_id} 两场排班间隔不足 {MIN_TURNAROUND_MINUTES} 分钟，可能来不及交接',
+            })
+
+        if same_room:
+            warnings.append({
+                'type': ConflictType.ROOM_CONFLICT,
+                'other_schedule_id': other.id,
+                'message': f'房间#{schedule.room_id} 两场排班间隔不足 {MIN_TURNAROUND_MINUTES} 分钟，可能来不及收拾',
+            })
+
+    return warnings
 
 
 def get_consecutive_work_days(dm_id: int, up_to_date: Optional[datetime] = None) -> int:

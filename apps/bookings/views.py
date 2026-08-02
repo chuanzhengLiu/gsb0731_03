@@ -9,6 +9,7 @@ from rest_framework.response import Response
 
 from .models import Booking, BookingPlayer, BookingStatus
 from .serializers import (
+    AvailableDMQuerySerializer,
     BookingCreateSerializer,
     BookingDetailSerializer,
     BookingListSerializer,
@@ -56,15 +57,13 @@ def _get_dm_booking_ids(user):
         return []
 
 
-def _get_available_dms(store_id, date, start_time, duration_minutes, script_id=None):
-    from django.conf import settings
-    User = settings.AUTH_USER_MODEL
+def _get_available_dms(store_id, date, start_time, duration_minutes, script_id=None,
+                       exclude_booking_id=None):
+    from django.apps import apps
+    from apps.scheduling.models import Schedule
+    from apps.scheduling.utils import turnaround_gap_if_too_close
 
-    try:
-        from django.apps import apps
-        User = apps.get_model('accounts', 'User')
-    except Exception:
-        pass
+    User = apps.get_model('accounts', 'User')
 
     start_dt = datetime.combine(date, start_time)
     end_dt = start_dt + timedelta(minutes=duration_minutes)
@@ -75,43 +74,60 @@ def _get_available_dms(store_id, date, start_time, duration_minutes, script_id=N
         is_active=True
     )
 
-    try:
-        from apps.scheduling.models import Schedule
-        conflicting_schedules = Schedule.objects.filter(
-            dm__store_id=store_id,
-            booking__date=date,
-        ).select_related('booking')
+    busy_dm_ids = set()
+    too_close_dm_gaps = {}
 
-        busy_dm_ids = set()
-        for schedule in conflicting_schedules:
-            booking = schedule.booking
-            if not booking:
-                continue
-            if booking.status in [BookingStatus.CANCELLED, BookingStatus.NO_SHOW]:
-                continue
-            booking_start = datetime.combine(booking.date, booking.start_time)
-            booking_end = booking_start + timedelta(minutes=booking.duration_minutes)
-            if start_dt < booking_end and booking_start < end_dt:
-                busy_dm_ids.add(schedule.dm_id)
+    # 一次查出相邻日期范围内本店所有排班，避免逐个 DM 查库；用 date±1 覆盖跨零点的相邻场次。
+    # 注意：Schedule.dm 指向 dms.DMProfile，门店信息在其关联的 User 上（DMProfile.store_id 只是个 Python property，
+    # 不能用于 ORM 过滤），所以按 dm__user__store_id 过滤，并用 dm.user_id 归一到 User 主键。
+    conflicting_schedules = Schedule.objects.filter(
+        dm__user__store_id=store_id,
+        booking__date__range=(date - timedelta(days=1), date + timedelta(days=1)),
+    ).select_related('booking', 'dm')
 
-        dms = dms.exclude(id__in=busy_dm_ids)
-    except Exception:
-        pass
+    for schedule in conflicting_schedules:
+        booking = schedule.booking
+        if not booking or not schedule.dm_id:
+            continue
+        if exclude_booking_id and booking.id == exclude_booking_id:
+            continue
+        if booking.status in [BookingStatus.CANCELLED, BookingStatus.NO_SHOW]:
+            continue
+        # 归一到 User 主键：可约列表是 User，排班外键是 DMProfile，两者主键不同，必须用 dm.user_id 对齐。
+        dm_user_id = schedule.dm.user_id
+        booking_start = datetime.combine(booking.date, booking.start_time)
+        booking_end = booking_start + timedelta(minutes=booking.duration_minutes)
+        if start_dt < booking_end and booking_start < end_dt:
+            busy_dm_ids.add(dm_user_id)
+            continue
+        # 时间没撞，但间隔不足 MIN_TURNAROUND_MINUTES（含首尾相接的 0）也不放出来。
+        gap = turnaround_gap_if_too_close(
+            start_dt, end_dt, booking_start, booking_end
+        )
+        if gap is not None:
+            prev = too_close_dm_gaps.get(dm_user_id)
+            if prev is None or gap < prev:
+                too_close_dm_gaps[dm_user_id] = gap
+
+    # 撞单的 DM 不算"间隔太近"，避免重复出现在两份名单里
+    for dm_id in busy_dm_ids:
+        too_close_dm_gaps.pop(dm_id, None)
+
+    dms = dms.exclude(id__in=busy_dm_ids | set(too_close_dm_gaps.keys()))
 
     dm_proficiency = {}
     if script_id:
-        try:
-            from apps.dms.models import DMScriptProficiency
-            proficiencies = DMScriptProficiency.objects.filter(
-                dm__in=dms,
-                script_id=script_id,
-            ).select_related('dm')
-            for prof in proficiencies:
-                dm_proficiency[prof.dm_id] = prof.proficiency_level
-        except Exception:
-            pass
+        # 熟练度真实存在于 dms.DMSkill（字段 proficiency），经 DMProfile 关联到 User；
+        # 原来引用的 DMScriptProficiency/proficiency_level 均不存在，这里按真实模型一次查出并归一到 User 主键。
+        DMSkill = apps.get_model('dms', 'DMSkill')
+        skills = DMSkill.objects.filter(
+            dm__user__store_id=store_id,
+            script_id=script_id,
+        ).values('dm__user_id', 'proficiency')
+        for skill in skills:
+            dm_proficiency[skill['dm__user_id']] = skill['proficiency']
 
-    return dms, dm_proficiency
+    return dms, dm_proficiency, too_close_dm_gaps
 
 
 def _get_script_recommendations(store_id, player_count, preferred_types=None,
@@ -153,7 +169,7 @@ def _get_script_recommendations(store_id, player_count, preferred_types=None,
         script_ids = list(queryset.values_list('id', flat=True))
         dm_score_map = {}
         for script_id in script_ids:
-            _, dm_proficiency = _get_available_dms(
+            _, dm_proficiency, _ = _get_available_dms(
                 store_id, date, start_time, duration_minutes, script_id
             )
             if dm_proficiency:
@@ -316,6 +332,71 @@ class BookingViewSet(viewsets.ModelViewSet):
             )
 
         return Response(BookingDetailSerializer(booking).data)
+
+    @action(detail=False, methods=['get'], url_path='available-dms')
+    def available_dms(self, request):
+        query_serializer = AvailableDMQuerySerializer(data=request.query_params)
+        query_serializer.is_valid(raise_exception=True)
+        data = query_serializer.validated_data
+
+        store_id = data['store_id']
+
+        role = _get_user_role(request.user)
+        user_store_id = _get_user_store_id(request.user)
+        if role != PLATFORM_ADMIN:
+            if not user_store_id or user_store_id != store_id:
+                return Response(
+                    {'detail': '无权访问该门店的可约DM'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            if role not in BOOKING_MANAGE_ROLES:
+                return Response(
+                    {'detail': '无权访问此接口'},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
+        dms, dm_proficiency, too_close_dm_gaps = _get_available_dms(
+            store_id=store_id,
+            date=data['date'],
+            start_time=data['start_time'],
+            duration_minutes=data.get('duration_minutes', 240),
+            script_id=data.get('script_id'),
+            exclude_booking_id=data.get('exclude_booking_id'),
+        )
+
+        available = [
+            {
+                'id': dm.id,
+                'name': dm.name or dm.username,
+                'proficiency': dm_proficiency.get(dm.id),
+            }
+            for dm in dms
+        ]
+
+        # 被间隔规则筛掉的 DM 不静默消失，带上名单和各自的间隔分钟数供前端解释
+        excluded_ids = list(too_close_dm_gaps.keys())
+        excluded_name_map = {}
+        if excluded_ids:
+            try:
+                from django.apps import apps
+                User = apps.get_model('accounts', 'User')
+                for dm in User.objects.filter(id__in=excluded_ids):
+                    excluded_name_map[dm.id] = dm.name or dm.username
+            except Exception:
+                pass
+        too_close = [
+            {
+                'id': dm_id,
+                'name': excluded_name_map.get(dm_id, ''),
+                'gap_minutes': gap,
+            }
+            for dm_id, gap in too_close_dm_gaps.items()
+        ]
+
+        return Response({
+            'available_dms': available,
+            'too_close_dms': too_close,
+        })
 
     @action(detail=False, methods=['get'])
     def recommend_scripts(self, request):

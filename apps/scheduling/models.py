@@ -16,6 +16,11 @@ class ConflictType(models.TextChoices):
     TIME_OVERLAP = 'time_overlap', '时间重叠'
 
 
+# 两场排班之间所需的最小缓冲时间（分钟）：DM 交接、房间清场都需要时间。
+# 间隔小于该值（首尾相接即间隔为 0 也算）时给出提醒，但不算冲突、不拦截排班。
+MIN_TURNAROUND_MINUTES = 30
+
+
 class Schedule(models.Model):
     booking = models.OneToOneField(
         'bookings.Booking',

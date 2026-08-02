@@ -324,6 +324,20 @@ class ScriptRecommendationQuerySerializer(serializers.Serializer):
     is_newbie = serializers.BooleanField(required=False, help_text='是否新手')
 
 
+class AvailableDMQuerySerializer(serializers.Serializer):
+    store_id = serializers.IntegerField(required=True, help_text='门店ID')
+    date = serializers.DateField(required=True, help_text='预约日期')
+    start_time = serializers.TimeField(required=True, help_text='开始时间')
+    duration_minutes = serializers.IntegerField(
+        required=False, default=240, min_value=1, help_text='时长(分钟)'
+    )
+    script_id = serializers.IntegerField(required=False, help_text='剧本ID(可选,用于返回熟练度)')
+    exclude_booking_id = serializers.IntegerField(
+        required=False,
+        help_text='改预订时排除自身,避免把自己算成占用/相邻'
+    )
+
+
 class BookingWithScriptRecommendationSerializer(serializers.Serializer):
     booking_data = BookingCreateSerializer()
     recommendation_query = ScriptRecommendationQuerySerializer(required=False)
