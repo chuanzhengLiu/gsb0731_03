@@ -5,7 +5,10 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 from django.db import models as django_models
 
-from .models import Schedule, ScheduleConflict, ScheduleStatus, ConflictType
+from .models import (
+    Schedule, ScheduleConflict, ScheduleStatus, ConflictType,
+    MIN_SESSION_GAP_MINUTES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +20,8 @@ def _get_schedule_time_range(schedule: Schedule) -> Tuple[Optional[datetime], Op
 
 
 def _times_overlap(s1: datetime, e1: datetime, s2: datetime, e2: datetime) -> bool:
-    return s1 <= e2 and s2 <= e1
+    # 半开区间 [start, end)：首尾相接（e1 == s2 或 e2 == s1）不算重叠
+    return s1 < e2 and s2 < e1
 
 
 def detect_conflicts_for_schedule(schedule: Schedule) -> List[ScheduleConflict]:
@@ -72,6 +76,89 @@ def detect_conflicts_for_schedule(schedule: Schedule) -> List[ScheduleConflict]:
             pass
 
     return conflicts_created
+
+
+def detect_nearby_sessions(schedule: Schedule) -> List[dict]:
+    """检测与当前排班同 DM/同房间、间隔不足 MIN_SESSION_GAP_MINUTES 的场次。
+
+    仅用于提醒，不算冲突也不阻止排班；重叠的场次属于冲突，由
+    detect_conflicts_for_schedule 处理，这里只关心首尾之间的间隔。
+    """
+    start1, end1 = _get_schedule_time_range(schedule)
+    if not start1 or not end1:
+        return []
+    if not schedule.dm_id and not schedule.room_id:
+        return []
+    if schedule.status == ScheduleStatus.CANCELLED:
+        return []
+
+    from apps.bookings.models import BookingStatus
+    inactive_booking_statuses = [BookingStatus.CANCELLED, BookingStatus.NO_SHOW]
+
+    min_gap = timedelta(minutes=MIN_SESSION_GAP_MINUTES)
+    warnings = []
+
+    # DM 和房间两个维度各自独立匹配，未分配的维度不参与过滤
+    dimension_q = django_models.Q()
+    if schedule.dm_id:
+        dimension_q |= django_models.Q(dm_id=schedule.dm_id)
+    if schedule.room_id:
+        dimension_q |= django_models.Q(room_id=schedule.room_id)
+
+    other_schedules = Schedule.objects.filter(
+        ~django_models.Q(id=schedule.id),
+        ~django_models.Q(status=ScheduleStatus.CANCELLED),
+        dimension_q,
+    ).select_related('dm', 'room', 'booking')
+
+    for other in other_schedules:
+        booking = other.booking
+        if booking and booking.status in inactive_booking_statuses:
+            continue
+
+        start2, end2 = _get_schedule_time_range(other)
+        if not start2 or not end2:
+            continue
+
+        if _times_overlap(start1, end1, start2, end2):
+            continue
+
+        if end1 <= start2:
+            gap = start2 - end1
+        else:
+            gap = start1 - end2
+
+        if gap >= min_gap:
+            continue
+
+        gap_minutes = int(gap.total_seconds() // 60)
+
+        is_same_dm = (
+            schedule.dm_id and other.dm_id and
+            schedule.dm_id == other.dm_id
+        )
+        is_same_room = (
+            schedule.room_id and other.room_id and
+            schedule.room_id == other.room_id
+        )
+
+        if is_same_dm:
+            warnings.append({
+                'type': 'dm',
+                'schedule_id': other.id,
+                'gap_minutes': gap_minutes,
+                'message': f'与排班#{other.id} 间隔仅 {gap_minutes} 分钟，DM#{schedule.dm_id} 可能赶不及',
+            })
+
+        if is_same_room:
+            warnings.append({
+                'type': 'room',
+                'schedule_id': other.id,
+                'gap_minutes': gap_minutes,
+                'message': f'与排班#{other.id} 间隔仅 {gap_minutes} 分钟，房间#{schedule.room_id} 可能来不及收拾',
+            })
+
+    return warnings
 
 
 def _create_or_update_conflict(

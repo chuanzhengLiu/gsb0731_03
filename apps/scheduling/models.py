@@ -1,6 +1,9 @@
 from django.db import models
 from django.utils import timezone
 
+# 同一 DM/房间两场排班的最小间隔（分钟），低于该值仅提示、不算冲突
+MIN_SESSION_GAP_MINUTES = 30
+
 
 class ScheduleStatus(models.TextChoices):
     ASSIGNED = 'assigned', '已分配'
