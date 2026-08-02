@@ -17,7 +17,7 @@ def _get_schedule_time_range(schedule: Schedule) -> Tuple[Optional[datetime], Op
 
 
 def _times_overlap(s1: datetime, e1: datetime, s2: datetime, e2: datetime) -> bool:
-    return s1 < e2 and s2 < e1
+    return s1 <= e2 and s2 <= e1
 
 
 def detect_conflicts_for_schedule(schedule: Schedule) -> List[ScheduleConflict]:
