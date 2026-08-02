@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from django.db import models as django_models
 
 from .models import Schedule, ScheduleConflict, ScheduleStatus, ConflictType
 
 logger = logging.getLogger(__name__)
+
+MIN_SCHEDULE_GAP_MINUTES = 30
 
 
 def _get_schedule_time_range(schedule: Schedule) -> Tuple[Optional[datetime], Optional[datetime]]:
@@ -17,7 +19,62 @@ def _get_schedule_time_range(schedule: Schedule) -> Tuple[Optional[datetime], Op
 
 
 def _times_overlap(s1: datetime, e1: datetime, s2: datetime, e2: datetime) -> bool:
-    return s1 <= e2 and s2 <= e1
+    return s1 < e2 and s2 < e1
+
+
+def _gap_minutes_between(s1: datetime, e1: datetime, s2: datetime, e2: datetime) -> int:
+    if _times_overlap(s1, e1, s2, e2):
+        return 0
+    if e1 <= s2:
+        gap = s2 - e1
+    else:
+        gap = s1 - e2
+    return int(gap.total_seconds() // 60)
+
+
+def get_dm_unavailabilities(
+    start: datetime,
+    end: datetime,
+    store_id: Optional[int] = None,
+    exclude_schedule_id: Optional[int] = None,
+) -> Dict[int, dict]:
+    from apps.bookings.models import BookingStatus
+
+    qs = Schedule.objects.filter(
+        ~django_models.Q(status=ScheduleStatus.CANCELLED),
+        dm_id__isnull=False,
+        booking__isnull=False,
+    ).exclude(
+        booking__status__in=[BookingStatus.CANCELLED, BookingStatus.NO_SHOW]
+    ).select_related('booking', 'dm', 'dm__user')
+
+    if exclude_schedule_id is not None:
+        qs = qs.exclude(id=exclude_schedule_id)
+
+    if store_id is not None:
+        qs = qs.filter(dm__user__store_id=store_id)
+
+    date_filter_start = (start - timedelta(days=1)).date()
+    date_filter_end = (end + timedelta(days=1)).date()
+    qs = qs.filter(booking__date__gte=date_filter_start, booking__date__lte=date_filter_end)
+
+    result: Dict[int, dict] = {}
+    for schedule in qs:
+        sched_start = schedule.scheduled_start_time
+        sched_end = schedule.scheduled_end_time
+        if not sched_start or not sched_end:
+            continue
+        gap = _gap_minutes_between(start, end, sched_start, sched_end)
+        if gap >= MIN_SCHEDULE_GAP_MINUTES:
+            continue
+        dm_id = schedule.dm_id
+        if dm_id not in result or gap < result[dm_id]['gap_minutes']:
+            result[dm_id] = {
+                'dm_id': dm_id,
+                'schedule_id': schedule.id,
+                'gap_minutes': gap,
+            }
+    return result
 
 
 def detect_conflicts_for_schedule(schedule: Schedule) -> List[ScheduleConflict]:
@@ -165,6 +222,54 @@ def resolve_conflicts_for_schedule(schedule: Schedule) -> int:
     count = qs.filter(resolved=False).count()
     qs.update(resolved=True)
     return count
+
+
+def get_schedule_gap_warnings(schedule: Schedule) -> List[dict]:
+    start1, end1 = _get_schedule_time_range(schedule)
+    if not start1 or not end1:
+        return []
+
+    warnings = []
+
+    other_schedules = Schedule.objects.filter(
+        ~django_models.Q(id=schedule.id),
+        ~django_models.Q(status=ScheduleStatus.CANCELLED),
+    ).select_related('dm', 'room')
+
+    for other in other_schedules:
+        start2, end2 = _get_schedule_time_range(other)
+        if not start2 or not end2:
+            continue
+
+        if _times_overlap(start1, end1, start2, end2):
+            continue
+
+        gap_minutes = _gap_minutes_between(start1, end1, start2, end2)
+
+        if gap_minutes >= MIN_SCHEDULE_GAP_MINUTES:
+            continue
+
+        if schedule.dm_id and other.dm_id and schedule.dm_id == other.dm_id:
+            warnings.append({
+                'type': 'dm_gap',
+                'schedule_id': other.id,
+                'gap_minutes': gap_minutes,
+                'message': (
+                    f'与排班#{other.id}间隔仅{gap_minutes}分钟，DM可能赶不及'
+                ),
+            })
+
+        if schedule.room_id and other.room_id and schedule.room_id == other.room_id:
+            warnings.append({
+                'type': 'room_gap',
+                'schedule_id': other.id,
+                'gap_minutes': gap_minutes,
+                'message': (
+                    f'与排班#{other.id}间隔仅{gap_minutes}分钟，房间可能来不及收拾'
+                ),
+            })
+
+    return warnings
 
 
 def get_consecutive_work_days(dm_id: int, up_to_date: Optional[datetime] = None) -> int:

@@ -171,6 +171,7 @@ class ScheduleDetailSerializer(serializers.ModelSerializer):
     player_count = serializers.IntegerField(read_only=True)
     booking_info = serializers.SerializerMethodField()
     conflict_count = serializers.SerializerMethodField()
+    gap_warnings = serializers.SerializerMethodField()
     can_modify = serializers.BooleanField(read_only=True)
 
     class Meta:
@@ -181,7 +182,7 @@ class ScheduleDetailSerializer(serializers.ModelSerializer):
             'script', 'script_name', 'script_type', 'script_duration',
             'status', 'status_display', 'actual_start_time', 'actual_end_time',
             'is_locked', 'can_modify', 'scheduled_start', 'scheduled_end',
-            'player_count', 'conflict_count', 'created_at', 'updated_at',
+            'player_count', 'conflict_count', 'gap_warnings', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
 
@@ -284,6 +285,10 @@ class ScheduleDetailSerializer(serializers.ModelSerializer):
             django_models.Q(schedule1=obj) | django_models.Q(schedule2=obj),
             resolved=False
         ).count()
+
+    def get_gap_warnings(self, obj):
+        from .utils import get_schedule_gap_warnings
+        return get_schedule_gap_warnings(obj)
 
     def get_can_modify(self, obj):
         return obj.can_modify(by_algorithm=False)

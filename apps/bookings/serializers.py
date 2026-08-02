@@ -178,10 +178,14 @@ class BookingCreateSerializer(serializers.ModelSerializer):
         return value
 
     def validate(self, attrs):
-        store = attrs.get('store')
-        date = attrs.get('date')
-        start_time = attrs.get('start_time')
-        duration_minutes = attrs.get('duration_minutes', 240)
+        store = attrs.get('store') or (self.instance.store if self.instance else None)
+        date = attrs.get('date') or (self.instance.date if self.instance else None)
+        start_time = attrs.get('start_time') or (self.instance.start_time if self.instance else None)
+        duration_minutes = attrs.get('duration_minutes')
+        if duration_minutes is None and self.instance:
+            duration_minutes = self.instance.duration_minutes
+        if duration_minutes is None:
+            duration_minutes = 240
 
         if store and date and start_time:
             start_dt = datetime.combine(date, start_time)
@@ -203,6 +207,36 @@ class BookingCreateSerializer(serializers.ModelSerializer):
                         f'该时段与已确认预约 #{booking.id} 冲突 '
                         f'({booking.start_time} - {booking.end_time()})'
                     )
+
+            if self.instance:
+                try:
+                    from apps.scheduling.models import Schedule
+                    from apps.scheduling.utils import (
+                        get_dm_unavailabilities,
+                        MIN_SCHEDULE_GAP_MINUTES,
+                    )
+
+                    schedule = Schedule.objects.filter(booking=self.instance).first()
+                    if schedule and schedule.dm_id:
+                        store_id = store.id if hasattr(store, 'id') else store
+                        unavailabilities = get_dm_unavailabilities(
+                            start=start_dt,
+                            end=end_dt,
+                            store_id=store_id,
+                            exclude_schedule_id=schedule.id,
+                        )
+                        if schedule.dm_id in unavailabilities:
+                            info = unavailabilities[schedule.dm_id]
+                            if info['gap_minutes'] == 0:
+                                raise serializers.ValidationError(
+                                    f'新时段与DM的其他排班时间冲突（排班#{info["schedule_id"]}）'
+                                )
+                            raise serializers.ValidationError(
+                                f'新时段与DM的其他排班间隔仅{info["gap_minutes"]}分钟，'
+                                f'不足{MIN_SCHEDULE_GAP_MINUTES}分钟（相邻排班#{info["schedule_id"]}）'
+                            )
+                except ImportError:
+                    pass
 
         return attrs
 

@@ -57,61 +57,40 @@ def _get_dm_booking_ids(user):
 
 
 def _get_available_dms(store_id, date, start_time, duration_minutes, script_id=None):
-    from django.conf import settings
-    User = settings.AUTH_USER_MODEL
-
-    try:
-        from django.apps import apps
-        User = apps.get_model('accounts', 'User')
-    except Exception:
-        pass
+    from apps.dms.models import DMProfile
+    from apps.scheduling.utils import get_dm_unavailabilities
 
     start_dt = datetime.combine(date, start_time)
     end_dt = start_dt + timedelta(minutes=duration_minutes)
 
-    dms = User.objects.filter(
-        role=UserRole.DM,
+    dm_profiles = DMProfile.objects.filter(
+        user__store_id=store_id,
+        user__is_active=True,
+    ).select_related('user')
+
+    unavailabilities = get_dm_unavailabilities(
+        start=start_dt,
+        end=end_dt,
         store_id=store_id,
-        is_active=True
     )
+    unavailable_dm_ids = set(unavailabilities.keys())
 
-    try:
-        from apps.scheduling.models import Schedule
-        conflicting_schedules = Schedule.objects.filter(
-            dm__store_id=store_id,
-            booking__date=date,
-        ).select_related('booking')
-
-        busy_dm_ids = set()
-        for schedule in conflicting_schedules:
-            booking = schedule.booking
-            if not booking:
-                continue
-            if booking.status in [BookingStatus.CANCELLED, BookingStatus.NO_SHOW]:
-                continue
-            booking_start = datetime.combine(booking.date, booking.start_time)
-            booking_end = booking_start + timedelta(minutes=booking.duration_minutes)
-            if start_dt < booking_end and booking_start < end_dt:
-                busy_dm_ids.add(schedule.dm_id)
-
-        dms = dms.exclude(id__in=busy_dm_ids)
-    except Exception:
-        pass
+    available_profiles = dm_profiles.exclude(id__in=unavailable_dm_ids)
 
     dm_proficiency = {}
     if script_id:
         try:
-            from apps.dms.models import DMScriptProficiency
-            proficiencies = DMScriptProficiency.objects.filter(
-                dm__in=dms,
+            from apps.dms.models import DMSkill
+            skills = DMSkill.objects.filter(
+                dm__in=available_profiles,
                 script_id=script_id,
             ).select_related('dm')
-            for prof in proficiencies:
-                dm_proficiency[prof.dm_id] = prof.proficiency_level
+            for skill in skills:
+                dm_proficiency[skill.dm_id] = skill.proficiency
         except Exception:
             pass
 
-    return dms, dm_proficiency
+    return available_profiles, dm_proficiency, unavailabilities
 
 
 def _get_script_recommendations(store_id, player_count, preferred_types=None,
@@ -153,7 +132,7 @@ def _get_script_recommendations(store_id, player_count, preferred_types=None,
         script_ids = list(queryset.values_list('id', flat=True))
         dm_score_map = {}
         for script_id in script_ids:
-            _, dm_proficiency = _get_available_dms(
+            _, dm_proficiency, _ = _get_available_dms(
                 store_id, date, start_time, duration_minutes, script_id
             )
             if dm_proficiency:
@@ -233,6 +212,88 @@ class BookingViewSet(viewsets.ModelViewSet):
             status=BookingStatus.PENDING,
             created_by=self.request.user
         )
+
+    @action(detail=False, methods=['get'], url_path='available-dms')
+    def available_dms(self, request):
+        store_id = request.query_params.get('store_id')
+        date_str = request.query_params.get('date')
+        start_time_str = request.query_params.get('start_time')
+        duration_minutes = request.query_params.get('duration_minutes')
+        script_id = request.query_params.get('script_id')
+
+        if not all([store_id, date_str, start_time_str, duration_minutes]):
+            return Response(
+                {'detail': '缺少必要参数: store_id, date, start_time, duration_minutes'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            store_id = int(store_id)
+            duration_minutes = int(duration_minutes)
+            date_val = datetime.strptime(date_str, '%Y-%m-%d').date()
+            start_time_val = datetime.strptime(start_time_str, '%H:%M').time()
+        except (ValueError, TypeError):
+            return Response(
+                {'detail': '参数格式错误'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if script_id:
+            try:
+                script_id = int(script_id)
+            except (ValueError, TypeError):
+                script_id = None
+
+        user = request.user
+        role = _get_user_role(user)
+        user_store_id = _get_user_store_id(user)
+
+        if role != PLATFORM_ADMIN:
+            if not user_store_id or user_store_id != store_id:
+                return Response(
+                    {'detail': '无权访问该门店'},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            if role not in BOOKING_MANAGE_ROLES:
+                return Response(
+                    {'detail': '无权访问此接口'},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        available_profiles, dm_proficiency, unavailabilities = _get_available_dms(
+            store_id, date_val, start_time_val, duration_minutes, script_id,
+        )
+
+        available_list = []
+        for profile in available_profiles:
+            item = {
+                'dm_id': profile.id,
+                'name': getattr(profile.user, 'name', '') or getattr(profile.user, 'username', ''),
+                'phone': getattr(profile.user, 'phone', ''),
+                'avg_rating': profile.avg_rating,
+                'total_sessions': profile.total_sessions,
+                'specialty_types': profile.specialty_types,
+            }
+            if script_id and profile.id in dm_proficiency:
+                item['proficiency'] = dm_proficiency[profile.id]
+            available_list.append(item)
+
+        unavailable_list = []
+        for dm_id, info in unavailabilities.items():
+            unavailable_list.append({
+                'dm_id': dm_id,
+                'conflict_schedule_id': info['schedule_id'],
+                'gap_minutes': info['gap_minutes'],
+                'reason': '时间冲突' if info['gap_minutes'] == 0 else f'与相邻场次间隔仅{info["gap_minutes"]}分钟',
+            })
+
+        from apps.scheduling.utils import MIN_SCHEDULE_GAP_MINUTES
+
+        return Response({
+            'available_dms': available_list,
+            'unavailable_dms': unavailable_list,
+            'min_gap_minutes': MIN_SCHEDULE_GAP_MINUTES,
+        })
 
     @action(detail=True, methods=['post'])
     def confirm(self, request, pk=None):
