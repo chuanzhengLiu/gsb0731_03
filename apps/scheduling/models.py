@@ -2,6 +2,9 @@ from django.db import models
 from django.utils import timezone
 
 
+TIGHT_SCHEDULE_GAP_MINUTES = 30
+
+
 class ScheduleStatus(models.TextChoices):
     ASSIGNED = 'assigned', '已分配'
     DM_CONFIRMED = 'dm_confirmed', 'DM已确认'

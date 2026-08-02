@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from django.db import models as django_models
 
-from .models import Schedule, ScheduleConflict, ScheduleStatus, ConflictType
+from .models import (
+    Schedule,
+    ScheduleConflict,
+    ScheduleStatus,
+    ConflictType,
+    TIGHT_SCHEDULE_GAP_MINUTES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +23,84 @@ def _get_schedule_time_range(schedule: Schedule) -> Tuple[Optional[datetime], Op
 
 
 def _times_overlap(s1: datetime, e1: datetime, s2: datetime, e2: datetime) -> bool:
-    return s1 <= e2 and s2 <= e1
+    return s1 < e2 and s2 < e1
+
+
+def _minutes_gap(s1: datetime, e1: datetime, s2: datetime, e2: datetime) -> int:
+    if _times_overlap(s1, e1, s2, e2):
+        return 0
+    latest_start = max(s1, s2)
+    earliest_end = min(e1, e2)
+    gap = latest_start - earliest_end
+    return max(0, int(gap.total_seconds() // 60))
+
+
+def get_tight_schedule_warnings(schedule: Schedule) -> List[Dict[str, Any]]:
+    start1, end1 = _get_schedule_time_range(schedule)
+    if not start1 or not end1:
+        return []
+
+    match_q = django_models.Q()
+    has_match = False
+    if schedule.dm_id:
+        match_q |= django_models.Q(dm_id=schedule.dm_id)
+        has_match = True
+    if schedule.room_id:
+        match_q |= django_models.Q(room_id=schedule.room_id)
+        has_match = True
+    if not has_match:
+        return []
+
+    other_schedules = Schedule.objects.filter(
+        ~django_models.Q(id=schedule.id),
+        ~django_models.Q(status=ScheduleStatus.CANCELLED),
+        match_q,
+    ).select_related('dm', 'room')
+
+    warnings: List[Dict[str, Any]] = []
+
+    for other in other_schedules:
+        start2, end2 = _get_schedule_time_range(other)
+        if not start2 or not end2:
+            continue
+
+        if _times_overlap(start1, end1, start2, end2):
+            continue
+
+        gap = _minutes_gap(start1, end1, start2, end2)
+        if gap >= TIGHT_SCHEDULE_GAP_MINUTES:
+            continue
+
+        gap_desc = '首尾相接' if gap == 0 else f'间隔仅{gap}分钟'
+
+        same_dm = bool(
+            schedule.dm_id and other.dm_id and schedule.dm_id == other.dm_id
+        )
+        same_room = bool(
+            schedule.room_id and other.room_id and schedule.room_id == other.room_id
+        )
+
+        if same_dm:
+            warnings.append({
+                'type': 'dm',
+                'schedule_id': other.id,
+                'gap_minutes': gap,
+                'scheduled_start': start2,
+                'scheduled_end': end2,
+                'message': f'与排班#{other.id}{gap_desc}，DM可能赶不及',
+            })
+
+        if same_room:
+            warnings.append({
+                'type': 'room',
+                'schedule_id': other.id,
+                'gap_minutes': gap,
+                'scheduled_start': start2,
+                'scheduled_end': end2,
+                'message': f'与排班#{other.id}{gap_desc}，房间可能来不及收拾',
+            })
+
+    return warnings
 
 
 def detect_conflicts_for_schedule(schedule: Schedule) -> List[ScheduleConflict]:
