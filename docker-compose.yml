@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: scriproot
+      MYSQL_DATABASE: script_killer_db
+      TZ: Asia/Shanghai
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "3308:3306"
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-pscriproot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: .
+    environment:
+      DB_NAME: script_killer_db
+      DB_USER: root
+      DB_PASSWORD: scriproot
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      SECRET_KEY: ${DJANGO_SECRET_KEY:-django-insecure-change-me-in-production}
+      DEBUG: "true"
+      ALLOWED_HOSTS: "*,localhost,127.0.0.1"
+    ports:
+      - "8000:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    volumes:
+      - .:/app
+      - backend_media:/app/media
+      - backend_backups:/app/backups
+
+volumes:
+  mysql_data:
+  backend_media:
+  backend_backups:
