@@ -51,7 +51,7 @@ class BookingPermission(permissions.BasePermission):
         if view.action in [
             'create', 'update', 'partial_update', 'destroy',
             'confirm', 'cancel', 'complete', 'no_show',
-            'recommend_scripts', 'bulk_add_players'
+            'recommend_scripts', 'available_dms', 'bulk_add_players'
         ]:
             return role in BOOKING_MANAGE_ROLES
 
